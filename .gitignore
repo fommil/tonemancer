@@ -1,0 +1,8 @@
+/tmp/
+Pipfile.lock
+__pycache__/
+tonemancer.json
+*.mid
+*.wav
+*.csv
+*.png
