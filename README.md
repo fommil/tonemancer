@@ -12,6 +12,6 @@ Requires a python environment with `matplotlib`, `numpy`, `sounddevice`, `tk` an
 
 Start with `python3 tonemancer.py`.
 
-The interface is a bit clunky, but the general idea is to use "Notes" to send/receive individual frequencies for distortion harmonic analysis. Make sure to check your outbound volume levels first (use the slider) so that you're not overpowering your pedals and clipping. Similarly, return volumes may need to be reduced because computer headphone sockets are used to receiving low power signals.
+The interface is a bit clunky, but the general idea is to use "Notes" to send/receive individual frequencies for distortion harmonic analysis. Make sure to check your outbound volume levels first (use the slider) so that you're not overpowering your pedals and clipping. Similarly, return volumes may need to be reduced because computer headphone sockets are used to receiving low power signals. I wrote an article detailing how I used this to chart the [distortion responses](https://medium.com/@fommil/guitar-distortion-response-753a2f0ab938) of my own pedals.
 
 The "EQ" mode is a white noise that can be used for EQ balancing.
