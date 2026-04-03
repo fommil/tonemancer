@@ -138,5 +138,5 @@ plt.title('Reference Spectrum')
 plt.show()
 
 # Local Variables:
-# compile-command: "python3 input_midi.py"
+# compile-command: "python3 tonemancer_generate.py"
 # End:

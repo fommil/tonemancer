@@ -55,9 +55,13 @@ for filename in sorted(glob.glob("result_*.csv")):
     peak_db = 20 * np.log10(np.maximum(np.max(all_vals), 1e-10))
     for col in reversed(sorted(data.keys(), key=lambda c: int(re.search(r'\d+', c).group()))):
         db = 20 * np.log10(np.maximum(np.array(data[col]), 1e-10)) - peak_db
-        ax.scatter(freqs, db, label=col, s=1)
+        if len(data) == 1:
+            ax.plot(freqs, db, label=col)
+        else:
+            ax.scatter(freqs, db, label=col, s=1)
 
-    ax.legend()
+    if len(data) > 1:
+        ax.legend()
     ax.set_title(filename.replace(".csv", ""))
 
     canvas = FigureCanvasAgg(fig)
@@ -66,5 +70,5 @@ for filename in sorted(glob.glob("result_*.csv")):
     print(f"Saved {out}")
 
 # Local Variables:
-# compile-command: "python3 response_analysis.py"
+# compile-command: "python3 tonemancer_images.py"
 # End:
