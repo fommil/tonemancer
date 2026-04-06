@@ -49,11 +49,13 @@ def process(f):
 # process("input_midi_note_b.wav")
 
 # manually created with
-# arecord -D hw:1,0 -f S16_LE -r 44100 -c 2 output.wav
+# arecord -l
+# gives (card,device) then convert to
+# arecord -D hw:2,0 -f S16_LE -r 44100 -c 2 output.wav
 # sox output.wav -c 1 output_mono.wav
 # and then chopped up in audacity
 
-for f in glob.glob("*.wav"):
+for f in glob.glob("input_*.wav"):
     process(f)
 
 exit(0)

@@ -75,10 +75,10 @@ for prefix, data in groups.items():
     for num in nums:
         waveform = data[num]["waveform"]
         sr = data[num]["sr"]
-        n_show = int(sr * 0.03)
-        start = max(0, len(waveform) - n_show * 2)
+        n_show = int(sr * 0.02)
+        start = max(0, len(waveform) - n_show * 10)
         for j in range(start, len(waveform) - n_show):
-            if waveform[j] <= 0 and waveform[j + 1] > 0:
+            if waveform[j] < 0 and waveform[j + 1] >= 0:
                 start = j
                 break
         snippet = waveform[start:start + n_show]
