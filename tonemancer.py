@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import re
 import threading
+import wave
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -85,7 +86,7 @@ def on_output_change(event):
 
 # TODO this should be auto set by the target which should really have
 #      a corresponding input file if the packs are created well
-modes = ["Notes", "EQ", "Guitar"]
+modes = ["Notes", "EQ"]
 
 for name in glob.glob("input_*.csv"):
     modes.append(name)
@@ -103,17 +104,21 @@ def on_mode_change(event):
             # TODO validate the notes
             notes = notes_entry.get().strip().split()
             ref_signal, ref_kurtosis  = generate_overdrive_signal(notes)
-        case "Guitar":
-            ref_signal, ref_kurtosis  = generate_guitar_notes_signal()
         case "EQ":
             ref_signal, ref_kurtosis = generate_ref_signal()
         case f:
             ref_signal, ref_kurtosis = load_ref_signal(f)
 
-    # we already had this in a lot of cases, so it's a bit wasteful
-    window = np.hanning(len(ref_signal))
-    spectrum = np.abs(np.fft.rfft(ref_signal * window)) * 2 / window.sum()
-    freqs = np.fft.rfftfreq(len(ref_signal), d=1/44100)
+    # calculates a normalisation factor where the peak in the frequency space
+    # hits 0db.
+    _, spectrum = chunk_spectrum(ref_signal)
+    peak_spectrum = np.max(spectrum)
+    if peak_spectrum > 0:
+        ref_signal = ref_signal / peak_spectrum
+
+    # compute display spectrum at current send volume
+    scaled = ref_signal * 10 ** (send_volume / 20)
+    freqs, spectrum = chunk_spectrum(scaled)
     if ref_kurtosis < 10:
         spectrum = maximum_filter1d(spectrum, size=256)
 
@@ -167,7 +172,7 @@ input_buffer = None
 
 # start with a bit of head room to grow into
 # really we should have a calibration step for a given setup
-send_volume = -10.0
+send_volume = -40.0
 
 # TODO receive volume slider
 # (this is just to visually line up with the target)
@@ -223,9 +228,7 @@ def update_plot():
 
     if input_buffer is not None and len(input_buffer) == buffer_size:
         data = np.array(input_buffer)
-        window = np.hanning(len(data))
-        spectrum = np.abs(np.fft.rfft(data * window)) * 2 / window.sum()
-        freqs = np.fft.rfftfreq(len(data), d=1/44100)
+        freqs, spectrum = chunk_spectrum(data)
 
         if ref_kurtosis < 10:
             spectrum = maximum_filter1d(spectrum, size=256)
@@ -239,8 +242,21 @@ def update_plot():
         ax.plot(freqs, db)
 
         update_ref_plot()
-        canvas.draw()
-    canvas.draw_idle()
+
+        ax_wave.clear()
+        data_wave = np.array(input_buffer)
+        n_show = int(44100 * 0.03)  # 30ms, enough for one C1 cycle
+        start = len(data_wave) - n_show * 2
+        for j in range(start, len(data_wave) - n_show):
+            if data_wave[j] <= 0 and data_wave[j + 1] > 0:
+                start = j
+                break
+        snippet = data_wave[start:start + n_show]
+        t_ms = np.arange(len(snippet)) / 44.1
+        ax_wave.plot(t_ms, snippet, color='tab:blue', linewidth=0.8)
+        ax_wave.tick_params(labelsize=5)
+
+    canvas.draw()
     root.after(250, update_plot)  # refresh this many ms
 
 def update_ref_plot():
@@ -270,7 +286,7 @@ def generate_overdrive_signal(notes):
 
     t = np.arange(buffer_size) / 44100
     signal = sum(np.sin(2 * np.pi * f * t) for f in freqs)
-    signal = 0.0178 * (signal / len(freqs)).astype(np.float32)
+    signal = (signal / len(freqs)).astype(np.float32)
     window = np.hanning(len(signal))
     spectrum = np.abs(np.fft.rfft(signal * window)) * 2 / window.sum()
     k = kurtosis(np.abs(spectrum))
@@ -284,7 +300,6 @@ def generate_ref_signal():
     rng = np.random.default_rng(42)
     spectrum[mask] = np.exp(2j * np.pi * rng.uniform(size=mask.sum()))
     signal = np.fft.irfft(spectrum)
-    signal = signal / np.sqrt(np.mean(signal**2))
     k = kurtosis(np.abs(spectrum))
     return signal.astype(np.float32), k
 
@@ -294,8 +309,6 @@ def load_ref_signal(filename):
     # adding random phase so that our signal doesn't pulse
     phase = np.exp(2j * np.pi * rng.uniform(size=len(spectrum)))
     signal = np.fft.irfft(spectrum * phase)
-    signal = signal / np.sqrt(np.mean(signal**2))
-    signal = signal * 10 ** (-35 / 20)
     k = kurtosis(np.abs(spectrum))
     return signal, k
 
@@ -310,37 +323,7 @@ def load_ref_spectrum(filename, rescale=None):
         print(f"... done with {filename}")
         spectrum = np.array(spectrum)
 
-        # in db
-        if rescale is not None:
-            target = 10 ** (rescale / 20)
-            spectrum = spectrum * (target / np.max(np.abs(spectrum)))
-
         return freqs, spectrum
-
-# weird idea that basically plays every note once and adds 4 octaves of
-# overtones
-def generate_guitar_notes_signal(harmonics=8):
-    freqs = np.fft.rfftfreq(buffer_size, d=1/44100)
-    spectrum = np.zeros(len(freqs), dtype=complex)
-    rng = np.random.default_rng(42)
-
-    # all semitones from E2 (82Hz) to E6 (1320Hz)
-    for semitone in range(48):  # 4 octaves = 48 semitones
-        fundamental = 82.41 * 2 ** (semitone / 12)
-        for h in range(1, harmonics + 1):
-            freq = fundamental * h
-            if freq > 8000:
-                break
-            bin_idx = int(round(freq * buffer_size / 44100))
-            if bin_idx < len(spectrum):
-                spectrum[bin_idx] = (1.0 / h) * rng.uniform(0.8, 1.2) * np.exp(2j * np.pi * rng.uniform())
-
-    signal = np.fft.irfft(spectrum)
-    # scaled so it isn't too loud
-    signal = 0.4 * signal / np.abs(signal).max()
-
-    k = kurtosis(np.abs(signal))
-    return signal.astype(np.float32), k
 
 root = tk.Tk()
 root.option_add('*Font', 'TkDefaultFont 18')
@@ -369,10 +352,10 @@ mode_frame.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
 mode_combo = ttk.Combobox(mode_frame, state="readonly", values=modes, width=20)
 mode_combo.pack(side="left")
 mode_combo.bind("<<ComboboxSelected>>", on_mode_change)
-mode_combo.current(1)
+mode_combo.current(0)
 
 notes_entry = ttk.Entry(mode_frame, width=20)
-notes_entry.insert(0, "B4")
+notes_entry.insert(0, "B2")
 notes_entry.bind("<Return>", on_mode_change)
 notes_entry.bind("<FocusOut>", on_mode_change)
 
@@ -381,11 +364,7 @@ notes_entry.bind("<FocusOut>", on_mode_change)
 start_stop = ttk.Button(root, text="Start", command=start)
 start_stop.grid(row=2, column=1, padx=5, pady=5, sticky="e")
 
-# TODO save button (with a filename box) that dumps the current response to csv
-
 # TODO record button to create a much better reference input than the midi
-
-# TODO pink noise input
 
 ttk.Label(root, text="Save:").grid(row=4, column=0, padx=5, pady=5, sticky="w")
 save_frame = ttk.Frame(root)
@@ -398,26 +377,30 @@ def save_response():
     if input_buffer is None or len(input_buffer) < buffer_size:
         print("No data to save")
         return
-    data = np.array(input_buffer)
-    window = np.hanning(len(data))
-    spectrum = np.abs(np.fft.rfft(data * window)) * 2 / window.sum()
-    freqs = np.fft.rfftfreq(len(data), d=1/44100)
+
     name = save_entry.get().strip()
-    name = name.replace(".csv", "")
+    name = name.replace(".wav", "")
+    data = np.array(input_buffer)
+
+    peak = np.max(np.abs(data))
+    if peak > 1.0:
+        data = data / peak
+    wav_data = (data * 32767).astype(np.int16)
+
+    with wave.open(name + ".wav", 'w') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(44100)
+        wf.writeframes(wav_data.tobytes())
+    print(f"Saved {name}.wav")
+
+    # convenient feature, if the filename ends in a number, increment it
     m = re.search(r'(\d+)$', name)
     if m:
         num = int(m.group(1)) + 1
         new_name = name[:m.start(1)] + str(num)
-    else:
-        num = 0
-        new_name = name + '_1'
-        name += "_0"
-
-    np.savetxt(name + ".csv", np.column_stack([freqs, spectrum]), delimiter=',', header='freq,value', comments='')
-    print(f"Saved {name}.csv")
-
-    save_entry.delete(0, tk.END)
-    save_entry.insert(0, new_name)
+        save_entry.delete(0, tk.END)
+        save_entry.insert(0, new_name)
 
 save_btn = ttk.Button(save_frame, text="Save", command=save_response)
 save_btn.pack(side="left", padx=(5, 0))
@@ -425,17 +408,20 @@ save_btn.config(state="disabled")
 
 def update_send_volume(v):
     global send_volume
-    print(f"send volume set to {v}")
+    #print(f"send volume set to {v}")
     send_volume = float(v)
 
 ttk.Label(root, text="Send Vol:").grid(row=5, column=0, padx=5, pady=5, sticky="w")
-send_slider = ttk.Scale(root, from_=-40, to=0, orient="horizontal", command=update_send_volume)
+send_slider = ttk.Scale(root, from_=-60, to=0, orient="horizontal", command=update_send_volume)
 send_slider.set(send_volume)
 send_slider.grid(row=5, column=1, padx=5, pady=5, sticky="ew")
 
 fig = Figure()
 ax = fig.add_subplot(111)
 ax_ref = fig.add_axes([0.75, 0.75, 0.15, 0.13])
+
+ax_wave = fig.add_axes([0.75, 0.60, 0.15, 0.13])
+
 canvas = FigureCanvasTkAgg(fig, master=root)
 canvas.get_tk_widget().grid(row=6, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
 root.columnconfigure(0, weight=0)
@@ -458,3 +444,4 @@ root.mainloop()
 # Local Variables:
 # compile-command: "python3 tonemancer.py"
 # End:
+

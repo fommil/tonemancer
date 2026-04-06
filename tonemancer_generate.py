@@ -8,6 +8,8 @@ import numpy as np
 
 import librosa
 
+from tonemancer_utils import *
+
 # this file is for generating input_ and target_ files from .wavs which are
 # manually created from guitar isolated tracks. It is a good idea to find two
 # sections in any song that you want to replicate: a single note played
@@ -24,18 +26,6 @@ def load_wav(filename):
     y, _ = librosa.load(filename, sr=44100)
     return y
 
-def spectrum(data):
-    chunk_size = min(len(data), 44100)
-    n_chunks = len(data) // chunk_size
-    spectra = []
-    for i in range(n_chunks):
-        chunk = data[i * chunk_size : (i + 1) * chunk_size]
-        window = np.hanning(chunk_size)
-        spectra.append(np.abs(np.fft.rfft(chunk * window)) * 2 / window.sum())
-    spectrum = np.mean(spectra, axis=0)
-    freqs = np.fft.rfftfreq(chunk_size, d=1/44100)
-    return freqs, spectrum
-
 def save_csv(data, filename):
     freqs, vals = data
     np.savetxt(filename, np.column_stack([freqs, vals]), delimiter=',', header='freq,value', comments='')
@@ -43,7 +33,7 @@ def save_csv(data, filename):
 def process(f):
     print(f)
     wav = load_wav(f)
-    res = spectrum(wav)
+    res = chunk_spectrum(wav, chunk_size=44100)
     save_csv(res, f.replace(".wav", ".csv"))
 
 # ffmpeg -ss 61.0 -t 4 -i input.mp3 target_verse.wav
