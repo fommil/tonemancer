@@ -4,7 +4,6 @@
 
 from collections import deque
 
-import csv
 import glob
 import json
 from pathlib import Path
@@ -18,10 +17,11 @@ import numpy as np
 import sounddevice as sd
 import tkinter as tk
 from tkinter import ttk
-from scipy.ndimage import maximum_filter1d, median_filter
+from scipy.ndimage import maximum_filter1d
 from scipy.stats import kurtosis
 
 from tonemancer_utils import *
+
 
 CONFIG_PATH = Path("tonemancer.json")
 
@@ -84,22 +84,37 @@ def on_output_change(event):
     config["output_device"] = output_combo.get()
     save_config()
 
-# TODO this should be auto set by the target which should really have
-#      a corresponding input file if the packs are created well
-modes = ["Notes", "EQ"]
+fixed_modes = ["Notes", "EQ", "Manual"]
+modes = fixed_modes.copy()
 
-for name in glob.glob("input_*.csv"):
+for name in glob.glob("mode_*.wav"):
     modes.append(name)
 
+# there's loads of potential for race conditions here but worst case it should
+# fix itself within a few seconds.
 def on_mode_change(event):
-    global ref_signal, ref_kurtosis, ref_spectrum
+    global ref_signal, ref_kurtosis, ref_spectrum, phase, input_buffer
 
     if mode_combo.get() == "Notes":
         notes_entry.pack(side="left", padx=(5, 0))
     else:
         notes_entry.pack_forget()
 
+    if mode_combo.get() in fixed_modes:
+        wav_check.pack_forget()
+    else:
+        wav_check.pack(side="left", padx=(10, 0))
+
     match mode_combo.get():
+        case "Manual":
+            # special case
+            with buf_lock:
+                ref_signal = None
+                ref_kurtosis = None
+                ref_spectrum = None
+                phase = None
+                input_buffer = deque(maxlen=buffer_size)
+                return
         case "Notes":
             # TODO validate the notes
             notes = notes_entry.get().strip().split()
@@ -108,6 +123,10 @@ def on_mode_change(event):
             ref_signal, ref_kurtosis = generate_ref_signal()
         case f:
             ref_signal, ref_kurtosis = load_ref_signal(f)
+
+    with buf_lock:
+        input_buffer = deque(maxlen=len(ref_signal))
+        phase = 0
 
     # calculates a normalisation factor where the peak in the frequency space
     # hits 0db.
@@ -128,13 +147,18 @@ def on_mode_change(event):
     update_ref_plot()
 
 ref_signal = None
+phase = 0
+
 ref_kurtosis = None
 ref_spectrum = None
 
-# TODO play the target (requires a matching .mp3 or .wav)
+# TODO play the target audibly
 targets = ["None"]
-for name in glob.glob("target_*.csv"):
+for name in glob.glob("target_*.wav"):
     targets.append(name)
+
+# TODO it might be an idea to have automatic mode selection
+# when changing the target, based on filename conventions
 
 def on_target_change(e):
     global target
@@ -142,33 +166,54 @@ def on_target_change(e):
         case "None":
             target = None
         case f:
-            target = load_ref_spectrum(f, rescale=0)
+            signal = load_wav(f)
+            target = chunk_spectrum(signal)
     update_plot()
 
 target = None
 
-phase = 0
 def callback(indata, outdata, frames, time, status):
     # indata: captured from mic (numpy array)
     # outdata: fill this with your signal to send
-    global phase
+    global phase, input_buffer, ref_signal
 
-    start = int(phase % len(ref_signal))
-    idx = np.arange(frames) + start
-    scale = 10 ** (send_volume / 20)
-    outdata[:] = (ref_signal[idx % len(ref_signal)] * scale).reshape(-1, 1)
+    with buf_lock:
+        buf = input_buffer
+        sig = ref_signal
+        p = phase
+
+    if sig is None:
+        # could be random noise in there, mute it
+        outdata[:] = 0
+    else:
+        start = int(p % len(sig))
+        idx = np.arange(frames) + start
+        scale = 10 ** (send_volume / 20)
+        outdata[:] = (sig[idx % len(sig)] * scale).reshape(-1, 1)
+
+    if buf is None:
+        return
 
     # hack to use the loopback to debug
-    #input_buffer.extend(outdata[:, 0])
+    #buf.extend(outdata[:, 0])
+    buf.extend(indata[:, 0])
 
-    input_buffer.extend(indata[:, 0])
-
-    phase = (phase + frames) % len(ref_signal)
+    # cover off a potential race condition here if the ref_signal and phase
+    # changed since we last looked. This wouldn't recover naturally unless the
+    # signals were the same length up to modulo the indata size.
+    if sig is not None:
+        with buf_lock:
+            if p == phase:
+                phase = (phase + frames) % len(sig)
 
 stream = None
 sample_seconds = 2
-buffer_size = 44100 * sample_seconds
 input_buffer = None
+
+# used for instanteous response signals
+buffer_size = 44100 * sample_seconds
+
+buf_lock = threading.Lock()
 
 # start with a bit of head room to grow into
 # really we should have a calibration step for a given setup
@@ -183,8 +228,7 @@ target_volume = 0.0
 
 def start():
     global stream
-    global input_buffer
-    global phase
+
     input_combo.config(state="disabled")
     output_combo.config(state="disabled")
     stream = sd.Stream(
@@ -193,24 +237,18 @@ def start():
         channels=1,
         callback=callback
     )
-    input_buffer = deque(maxlen=buffer_size)
-    phase = 0
     stream.start()
     start_stop.config(text="Stop", command=stop)
     save_btn.config(state="readonly")
 
 def stop():
     global stream
-    global input_buffer
-    global phase
 
     #stream.stop() # super flakey and blocks like crazy
     stream.abort()
     stream.close()
 
     stream = None
-    input_buffer = None
-    phase = None
     start_stop.config(text="Start", command=start)
     input_combo.config(state="readonly")
     output_combo.config(state="readonly")
@@ -226,35 +264,40 @@ def update_plot():
         db = 20 * np.log10(np.maximum(spectrum, 1e-10)) + target_volume
         ax.plot(freqs, db, color='green')
 
-    if input_buffer is not None and len(input_buffer) == buffer_size:
-        data = np.array(input_buffer)
+    with buf_lock:
+        buf = input_buffer
+
+    #print(f"buffer is {len(buf)} bytes")
+    if buf is not None and len(buf) >= 22050:
+        data = np.array(buf)
         freqs, spectrum = chunk_spectrum(data)
 
-        if ref_kurtosis < 10:
+        if ref_kurtosis is not None and ref_kurtosis < 10:
             spectrum = maximum_filter1d(spectrum, size=256)
             #spectrum = median_filter(spectrum, size=256)
 
         db = 20 * np.log10(np.maximum(spectrum, 1e-10)) + recv_volume
 
-        # if ref_kurtosis < 10:
-        #     ax.scatter(freqs, db, s=5)
-        # else:
         ax.plot(freqs, db)
 
         update_ref_plot()
 
-        ax_wave.clear()
-        data_wave = np.array(input_buffer)
-        n_show = int(44100 * 0.03)  # 30ms, enough for one C1 cycle
-        start = len(data_wave) - n_show * 2
-        for j in range(start, len(data_wave) - n_show):
-            if data_wave[j] <= 0 and data_wave[j + 1] > 0:
-                start = j
-                break
-        snippet = data_wave[start:start + n_show]
-        t_ms = np.arange(len(snippet)) / 44.1
-        ax_wave.plot(t_ms, snippet, color='tab:blue', linewidth=0.8)
-        ax_wave.tick_params(labelsize=5)
+        # don't plot this if it's not an instanteous signal
+        if mode_combo.get() in fixed_modes or fast_hack.get():
+            ax_wave.set_visible(True)
+            ax_wave.clear()
+            n_show = int(44100 * 0.03)  # 30ms window
+            start = len(data) - n_show * 10
+            for j in range(start, len(data) - n_show):
+                if data[j] <= 0 and data[j + 1] > 0:
+                    start = j
+                    break
+            snippet = data[start:start + n_show]
+            t_ms = np.arange(len(snippet)) / 44.1
+            ax_wave.plot(t_ms, snippet, color='tab:blue', linewidth=0.8)
+            ax_wave.tick_params(labelsize=5)
+        else:
+            ax_wave.set_visible(False)
 
     canvas.draw()
     root.after(250, update_plot)  # refresh this many ms
@@ -273,9 +316,6 @@ def update_ref_plot():
 
 # a single frequency with no overtones
 def generate_overdrive_signal(notes):
-    # TODO save to config
-    # TODO populated when loading a target file
-
     freqs = []
     for n in notes:
         # could handle flats and missing octaves here
@@ -284,7 +324,13 @@ def generate_overdrive_signal(notes):
     if not freqs:
         return None, None
 
-    t = np.arange(buffer_size) / 44100
+    # wraparound to the nearest full loop so we don't get a discontinuity
+    lowest = min(freqs)
+    period_samples = 44100 / lowest
+    n_periods = round(buffer_size / period_samples)
+    sig_len = int(n_periods * period_samples)
+    t = np.arange(sig_len) / 44100
+
     signal = sum(np.sin(2 * np.pi * f * t) for f in freqs)
     signal = (signal / len(freqs)).astype(np.float32)
     window = np.hanning(len(signal))
@@ -303,27 +349,21 @@ def generate_ref_signal():
     k = kurtosis(np.abs(spectrum))
     return signal.astype(np.float32), k
 
-def load_ref_signal(filename):
-    freqs, spectrum = load_ref_spectrum(filename)
-    rng = np.random.default_rng(42)
-    # adding random phase so that our signal doesn't pulse
-    phase = np.exp(2j * np.pi * rng.uniform(size=len(spectrum)))
-    signal = np.fft.irfft(spectrum * phase)
+def load_ref_signal(f):
+    data = load_wav(f)
+
+    freqs, spectrum = chunk_spectrum(data, 44100)
+
+    if fast_hack.get():
+        rng = np.random.default_rng(42)
+        # adding random phase so that our signal doesn't pulse
+        p = np.exp(2j * np.pi * rng.uniform(size=len(spectrum)))
+        signal = np.fft.irfft(spectrum * p)
+    else:
+        signal = data
+
     k = kurtosis(np.abs(spectrum))
     return signal, k
-
-def load_ref_spectrum(filename, rescale=None):
-    print(f"loading {filename}")
-    with open(filename) as f:
-        freqs = []
-        spectrum = []
-        for row in csv.DictReader(f):
-            freqs.append(float(row["freq"]))
-            spectrum.append(float(row["value"]))
-        print(f"... done with {filename}")
-        spectrum = np.array(spectrum)
-
-        return freqs, spectrum
 
 root = tk.Tk()
 root.option_add('*Font', 'TkDefaultFont 18')
@@ -341,7 +381,7 @@ output_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 output_combo.bind("<<ComboboxSelected>>", on_output_change)
 
 ttk.Label(root, text="Target:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
-target_combo = ttk.Combobox(root, state="readonly", values=targets, width=64)
+target_combo = ttk.Combobox(root, state="readonly", values=targets, width=48)
 target_combo.grid(row=2, column=1, padx=5, pady=5, sticky="w")
 target_combo.bind("<<ComboboxSelected>>", on_target_change)
 target_combo.current(0)
@@ -349,7 +389,7 @@ target_combo.current(0)
 ttk.Label(root, text="Mode:").grid(row=3, column=0, padx=5, pady=5, sticky="w")
 mode_frame = ttk.Frame(root)
 mode_frame.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
-mode_combo = ttk.Combobox(mode_frame, state="readonly", values=modes, width=20)
+mode_combo = ttk.Combobox(mode_frame, state="readonly", values=modes, width=48)
 mode_combo.pack(side="left")
 mode_combo.bind("<<ComboboxSelected>>", on_mode_change)
 mode_combo.current(0)
@@ -359,12 +399,13 @@ notes_entry.insert(0, "B2")
 notes_entry.bind("<Return>", on_mode_change)
 notes_entry.bind("<FocusOut>", on_mode_change)
 
+fast_hack = tk.BooleanVar(value=False)
+wav_check = ttk.Checkbutton(mode_frame, text="Fast Hack", variable=fast_hack, command=lambda: on_mode_change(None))
+
 # ttk.Button(root, text="Refresh", command=refresh).grid(row=2, column=1, padx=5, pady=5, sticky="e")
 
 start_stop = ttk.Button(root, text="Start", command=start)
 start_stop.grid(row=2, column=1, padx=5, pady=5, sticky="e")
-
-# TODO record button to create a much better reference input than the midi
 
 ttk.Label(root, text="Save:").grid(row=4, column=0, padx=5, pady=5, sticky="w")
 save_frame = ttk.Frame(root)
@@ -374,13 +415,16 @@ save_entry.pack(side="left", fill="x", expand=True)
 save_entry.insert(0, "response_")
 
 def save_response():
-    if input_buffer is None or len(input_buffer) < buffer_size:
+    with buf_lock:
+        buf = input_buffer
+
+    if buf is None:
         print("No data to save")
         return
 
     name = save_entry.get().strip()
     name = name.replace(".wav", "")
-    data = np.array(input_buffer)
+    data = np.array(buf)
 
     peak = np.max(np.abs(data))
     if peak > 1.0:
@@ -428,7 +472,6 @@ root.columnconfigure(0, weight=0)
 root.columnconfigure(1, weight=1)
 root.rowconfigure(6, weight=1)  # whichever row the canvas is in
 
-
 refresh()
 on_mode_change(None)
 update_plot()
@@ -444,4 +487,3 @@ root.mainloop()
 # Local Variables:
 # compile-command: "python3 tonemancer.py"
 # End:
-

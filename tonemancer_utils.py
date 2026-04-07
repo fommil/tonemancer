@@ -1,10 +1,9 @@
 import numpy as np
+import librosa
 
-from matplotlib.ticker import FixedLocator, FixedFormatter
 
 note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-NOTE_FREQS = {}
 NOTE_FREQS = {}
 for i in range(109):
     # 32.7Hz = C1
@@ -37,16 +36,28 @@ def setup_freq_axis(ax, ylim=(-60, 0), minors=True):
     else:
         ax.set_xticklabels([n for n, _ in majors])
 
-def chunk_spectrum(data, sr=44100, chunk_size=44100):
-    n_chunks = len(data) // chunk_size
-    if n_chunks == 0:
-        n_chunks = 1
-        chunk_size = len(data)
+def chunk_spectrum(data, sr=44100, chunk_size=22050):
+    # Welch-style: 50% overlapping segments for stable averaging
+    hop = chunk_size // 2
+    window = np.hanning(chunk_size)
+    norm = 2 / window.sum()
     spectra = []
-    for i in range(n_chunks):
-        chunk = data[i * chunk_size : (i + 1) * chunk_size]
-        window = np.hanning(chunk_size)
-        spectra.append(np.abs(np.fft.rfft(chunk * window)) * 2 / window.sum())
+    start = 0
+    while start + chunk_size <= len(data):
+        chunk = data[start : start + chunk_size]
+        spectra.append(np.abs(np.fft.rfft(chunk * window)) * norm)
+        start += hop
+    if not spectra:
+        window = np.hanning(len(data))
+        spec = np.abs(np.fft.rfft(data * window)) * 2 / window.sum()
+        freqs = np.fft.rfftfreq(len(data), d=1/sr)
+        return freqs, spec
     spec = np.mean(spectra, axis=0)
     freqs = np.fft.rfftfreq(chunk_size, d=1/sr)
     return freqs, spec
+
+# librosa is an external dependency but will handle different precisions
+# and sample rates.
+def load_wav(filename):
+    y, _ = librosa.load(filename, sr=44100)
+    return y
