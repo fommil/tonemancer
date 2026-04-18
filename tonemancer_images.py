@@ -80,7 +80,7 @@ for prefix, data in groups.items():
     ax_wave.set_xlabel("ms", fontsize=6)
 
     canvas = FigureCanvasAgg(fig)
-    out = f"result_{prefix.rstrip('_')}.png"
+    out = f"{prefix.rstrip('_')}.png"
     fig.savefig(out, dpi=150, bbox_inches='tight')
     print(f"Saved {out}")
 
