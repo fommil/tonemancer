@@ -315,6 +315,9 @@ def update_ref_plot():
     canvas.draw_idle()
 
 # a single frequency with no overtones
+#
+# TODO this is definitely sending some weird edge effects sometimes, I can hear
+# a burst every few seconds when using this
 def generate_overdrive_signal(notes):
     freqs = []
     for n in notes:
